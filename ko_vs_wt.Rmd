@@ -1,0 +1,362 @@
+---
+title: "DE vs iPSCs (KO and WT)"
+author: "Akshay Bareja"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    code_folding: hide
+    toc: true
+  pdf_document:
+    toc: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(ggrepel)
+library(readxl)
+library(FactoMineR)
+library(factoextra)
+library(pheatmap)
+library(limma)
+library(DT)
+library(fgsea)
+library(ggrepel)
+library(missRanger)
+library(plotly)
+library(patchwork)
+
+```
+
+## Analysis Summary
+
+The data used in this analysis were obtained from the `filtered area normalized` sheet in the file `HMC-25-047_Lalowski_20052025_TA.xls`
+
+```{r message = FALSE, warning = FALSE}
+# import metabolite abundance data (normalized) 
+hmc_df <- read_excel("data/HMC-25-047_Lalowski_20052025_TA.xls",
+                      sheet = "Filtered area normalized",
+                      skip = 14) %>% 
+            dplyr::select(Compounds, matches("KO|WT"))
+
+# hmc_df %>%
+#   dplyr::filter(if_all(.cols = where(is.numeric),
+#                        .fns = is.na)) %>%
+#   nrow()
+# There are 313 metabolites that have NAs for all iPSC and DE samples         
+
+# Filter these out
+hmc_df <- hmc_df %>% 
+                dplyr::filter(!if_all(.cols = where(is.numeric),
+                                     .fns = is.na))
+
+# how many metabolites have all missing values for JUST one condition?
+# iPSCs
+missing_ipsc <- hmc_df %>% 
+                  dplyr::filter(if_all(.cols = contains("PSCs"),
+                                       .fns = is.na)) %>%
+                  dplyr::pull(Compounds)
+
+# DE
+missing_de <- hmc_df %>% 
+                  dplyr::filter(if_all(.cols = contains("DE"),
+                                       .fns = is.na)) %>%
+                  dplyr::pull(Compounds)
+
+# Make a note of these but REMOVE from downstream analysis
+# Why? We can perhaps qualitatively say that there is significant differential abundance for these metabolites because they are completely absent in one or the other condition
+# However, I am unsure about including them in the imputation process below i.e. what value do we use to impute?
+hmc_df <- hmc_df %>% 
+            dplyr::filter(!(Compounds %in% c(missing_ipsc, missing_de)))
+
+# count the number of missing values in each row
+partially_missing <- hmc_df %>% 
+  dplyr::rowwise() %>% 
+  dplyr::mutate(num_na = sum(is.na(c_across(-Compounds)))) %>% # most metabolites have no missing values, but a few have >= 10 metabolites
+  dplyr::filter(num_na >= 10) %>% 
+  dplyr::select(-num_na) %>% 
+  dplyr::ungroup() %>% 
+  tidyr::pivot_longer(cols = -Compounds,
+                      names_to = "sample",
+                      values_to = "abundance") %>% 
+  dplyr::mutate(group = str_extract(sample, "(?<=^\\d{3}\\_).+(?=\\_[:digit:]\\_)")) %>% # extract everything between the first 3 digits followed by an underscore (the look-behind) and the pattern - "underscore-digit-underscore" (the look-ahead)
+  dplyr::group_by(Compounds, group) %>% 
+  dplyr::count(condition = is.na(abundance)) %>% 
+  dplyr::filter(condition) %>% 
+  dplyr::ungroup() %>% 
+  dplyr::filter(!(Compounds %in% c("ALLANTOIN", "ERYTHRITOL"))) %>% # keep these
+  dplyr::select(Compounds) %>% 
+  dplyr::distinct(Compounds) %>% 
+  dplyr::pull(Compounds)
+
+# Note: 3 out of these 5 metabolites are either completely or nearly completely missing in one of the four groups
+# Decision: Make a note of these, but remove them from further analysis
+hmc_df <- hmc_df %>% 
+            dplyr::filter(!(Compounds %in% partially_missing))
+
+# Impute remaining missing values using missForest algorithm
+hmc_df_imp <- missRanger(hmc_df, 
+                          formula = . ~ . - Compounds, # using all variables except for Compounds to perform imputation
+                          pmm.k = 5,
+                          seed = 42, # ensuring imputation is replicable
+                          verbose = 0) # see ?missRanger for the advantages of doing this
+# I kept all function defaults except pmm.k, which I set to 5 as was done in the missRanger vignette
+# And I also set the seed to 42
+
+# are there any 0 values?
+# apply(hmc_df_imp, 2, function(x) sum(x == 0))
+# no. Safe to log-transform all values
+
+hmc_df_reshape <- hmc_df_imp %>% 
+                    tidyr::pivot_longer(cols = -Compounds,
+                                        names_to = "sample",
+                                        values_to = "abundance") %>% 
+                    dplyr::mutate(tech_rep = str_extract(sample, "inj\\d$")) %>% 
+                    dplyr::mutate(bio_rep = str_extract(sample, "[^inj]+"),
+                                  bio_rep = str_remove(bio_rep, "\\_$")) %>% 
+                    dplyr::relocate(bio_rep, .before = tech_rep)
+
+# make sample metadata df
+metadata <- hmc_df_reshape %>% 
+              dplyr::select(sample, bio_rep, tech_rep) %>% 
+              dplyr::distinct() %>% 
+              dplyr::mutate(group = str_extract(sample, "(?<=^\\d{3}\\_).+(?=\\_[:digit:]\\_)"))
+rownames(metadata) <- metadata$sample
+
+# make limma matrix
+limma_df <- hmc_df_reshape %>% 
+              dplyr::select(sample, Compounds, abundance) %>% 
+              tidyr::pivot_wider(
+                names_from = sample,
+                values_from = abundance
+              ) %>% 
+              dplyr::mutate(across(where(is.numeric), log2)) # log transform
+
+limma_mat <- limma_df[-1] %>% 
+              as.matrix()
+rownames(limma_mat) <- limma_df$Compounds
+
+# confirm correct order
+identical(colnames(limma_mat), rownames(metadata)) # TRUE 
+```
+
+### Visualizations
+```{r message = FALSE, warning = FALSE}
+# sample distributions
+# density plot
+limma_mat %>% 
+  data.frame() %>% 
+  tibble::rownames_to_column("Compounds") %>% 
+  tidyr::pivot_longer(cols = -Compounds,
+                      names_to = "sample",
+                      values_to = "log2_abundance") %>% 
+  dplyr::mutate(sample = str_remove(sample, "^X")) %>% 
+  dplyr::inner_join(metadata, join_by(sample)) %>% 
+  ggplot(aes(log2_abundance, col = group)) +
+  geom_density() +
+  theme_bw() +
+  theme(legend.position = "bottom") +
+  labs(title = "Sample Distributions for each Time-point",
+       y = "")
+
+# median and mean abundance by group
+limma_mat %>% 
+  data.frame() %>% 
+  tibble::rownames_to_column("Compounds") %>% 
+  tidyr::pivot_longer(cols = -Compounds,
+                      names_to = "sample",
+                      values_to = "log2_abundance") %>% 
+  dplyr::mutate(sample = str_remove(sample, "^X")) %>% 
+  dplyr::inner_join(metadata, join_by(sample)) %>% 
+  dplyr::group_by(group) %>% 
+  dplyr::summarise(mean_abundance = mean(log2_abundance),
+                   median_abundance = median(log2_abundance))
+
+# boxplots
+limma_mat %>% 
+  data.frame() %>% 
+  tibble::rownames_to_column("Compounds") %>% 
+  tidyr::pivot_longer(cols = -Compounds,
+                      names_to = "sample",
+                      values_to = "log2_abundance") %>% 
+  dplyr::mutate(sample = str_remove(sample, "^X")) %>% 
+  dplyr::inner_join(metadata, join_by(sample)) %>% 
+  ggplot(aes(group, log2_abundance, col = sample)) +
+  geom_boxplot() +
+  theme_bw() +
+  theme(legend.position = "none") +
+  labs(title = "Sample Distributions for each Time-point",
+       y = "")
+
+# PCA plot
+hmc_df_t <- limma_mat %>% 
+  data.frame() %>% 
+  tibble::rownames_to_column("Compounds") %>% 
+  tidyr::pivot_longer(cols = -Compounds,
+                      names_to = "sample",
+                      values_to = "log2_abundance") %>% 
+  dplyr::mutate(sample = str_remove(sample, "^X")) %>%  
+  dplyr::inner_join(metadata, join_by(sample)) %>% 
+  dplyr::select(sample, Compounds, log2_abundance) %>% 
+  tidyr::pivot_wider(
+    names_from = Compounds,
+    values_from = log2_abundance
+  )
+
+hmc_mat_t <- as.matrix(hmc_df_t[-1])
+rownames(hmc_mat_t) <- hmc_df_t$sample
+
+pca.res_full <- PCA(hmc_mat_t, graph = FALSE)
+
+# Visualize eigenvalues/variances
+fviz_screeplot(pca.res_full, addlabels = TRUE, ylim = c(0, 75))
+
+# PCA plot
+pca_plot_groups <- fviz_pca_ind(pca.res_full,
+             habillage = factor(metadata$group),
+             geom = "point",
+             addEllipses = TRUE) +
+                  labs(title = "Coloured by group")
+
+pca_plot_tech_reps <- fviz_pca_ind(pca.res_full,
+             habillage = factor(metadata$bio_rep),
+             geom = "point",
+             addEllipses = FALSE,
+             invisible="quali") + # remove centroid
+  labs(title = "Coloured by technical replicate") +
+  theme(legend.position = "none")
+# looks like technical replicates are close to each other
+
+pca_plot_groups / 
+  pca_plot_tech_reps +
+    plot_annotation(
+      tag_levels = "A"
+    ) +
+    plot_layout(
+      axes = "collect"
+    )
+
+# heatmap
+heatmap_mat <- as.matrix(limma_mat)
+rownames(heatmap_mat) <- rownames(limma_mat)
+
+# make column annotation df
+annotation_col_df <- tibble::tibble(
+  `technical replicate` = metadata$tech_rep,
+  group = metadata$group
+) %>% data.frame()
+rownames(annotation_col_df) <- colnames(heatmap_mat)
+
+# plot heatmap
+pheatmap(heatmap_mat,
+         scale = "row",
+         clustering_distance_rows = "correlation",
+         clustering_distance_cols = "correlation",
+         annotation_col = annotation_col_df,
+         show_colnames = FALSE,
+         fontsize = 7,
+         fontsize_row = 4, 
+         main = "Clustering Metabolites and Samples by Correlation")
+```
+
+### Differential Abundance Analysis
+
+```{r message = FALSE, warning = FALSE}
+# create design matrix
+design <- model.matrix(~0 + group, data = metadata)
+# design
+
+# Use duplicateCorrelation to estimate within-sample correlation
+corfit <- duplicateCorrelation(limma_mat, 
+                               design, 
+                               block = metadata$bio_rep)
+#corfit$consensus.correlation
+# 0.71
+
+# fit models
+fit <- lmFit(
+              limma_mat, 
+              design, 
+              block = metadata$bio_rep,
+              correlation = corfit$consensus.correlation
+             )
+
+# create contrast matrix
+contrast.matrix <- makeContrasts(
+    "iPSC_KO_vs_WT" = groupPSCs_AMOTL2_KO - groupPSCs_WT,
+    "DE_KO_vs_WT" = groupDE_AMOTL2_KO - groupDE_WT,
+    "WT_DE_vs_iPSC" = groupDE_WT - groupPSCs_WT,
+    "KO_DE_vs_iPSC" = groupDE_AMOTL2_KO - groupPSCs_AMOTL2_KO,
+    "Interaction" = (groupDE_AMOTL2_KO - groupPSCs_AMOTL2_KO) - (groupDE_WT - groupPSCs_WT),
+    levels = design
+)
+
+fit2 <- contrasts.fit(fit, contrast.matrix)
+efit <- eBayes(fit2)
+```
+
+#### iPSC - KO vs WT
+
+```{r message = FALSE, warning = FALSE}
+topTable(efit, coef = "iPSC_KO_vs_WT",
+         number = nrow(limma_mat)) %>% 
+  tibble::rownames_to_column("Compound") %>% 
+  dplyr::arrange(P.Value) %>% 
+  dplyr::mutate(across(where(is.numeric), ~round(.x, 2))) %>% 
+  DT::datatable(
+    caption = "iPSC - KO vs WT"
+  )
+```
+
+#### DE - KO vs WT
+
+```{r message = FALSE, warning = FALSE}
+topTable(efit, coef = "DE_KO_vs_WT",
+         number = nrow(limma_mat)) %>% 
+  tibble::rownames_to_column("Compound") %>% 
+  dplyr::arrange(P.Value) %>% 
+  dplyr::mutate(across(where(is.numeric), ~round(.x, 2))) %>% 
+  DT::datatable(
+    caption = "DE - KO vs WT"
+  )
+```
+
+#### WT - DE vs iPSC
+
+```{r message = FALSE, warning = FALSE}
+topTable(efit, coef = "WT_DE_vs_iPSC",
+         number = nrow(limma_mat)) %>% 
+  tibble::rownames_to_column("Compound") %>% 
+  dplyr::arrange(P.Value) %>% 
+  dplyr::mutate(across(where(is.numeric), ~round(.x, 2))) %>% 
+  DT::datatable(
+    caption = "WT - DE vs iPSC"
+  )
+```
+
+#### KO - DE vs iPSC
+
+```{r message = FALSE, warning = FALSE}
+topTable(efit, coef = "KO_DE_vs_iPSC",
+         number = nrow(limma_mat)) %>% 
+  tibble::rownames_to_column("Compound") %>% 
+  dplyr::arrange(P.Value) %>% 
+  dplyr::mutate(across(where(is.numeric), ~round(.x, 2))) %>% 
+  DT::datatable(
+    caption = "KO - DE vs iPSC"
+  )
+```
+
+#### Interaction Effect
+
+```{r message = FALSE, warning = FALSE}
+topTable(efit, coef = "Interaction",
+         number = nrow(limma_mat)) %>% 
+  tibble::rownames_to_column("Compound") %>% 
+  dplyr::arrange(P.Value) %>% 
+  dplyr::mutate(across(where(is.numeric), ~round(.x, 2))) %>% 
+  DT::datatable(
+    caption = "Interaction effect"
+  )
+```
